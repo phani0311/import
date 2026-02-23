@@ -134,3 +134,34 @@ spec:
               rm -f "$LOG_FILE"
 
               echo "--- Done ---"
+---
+
+db-restore-rds_app_auth_role = {
+      create          = true
+      name            = "db-restore-rds-app-auth-role"
+      namespace       = "prd-01"
+      service_account = "db-restore"
+      db_user_name    = "cs-engine"
+      policy_arns     = ["arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"]
+
+      # Add a custom inline policy
+      inline_policies = {
+        "s3-specific-bucket" = jsonencode({
+          Version = "2012-10-17"
+          Statement = [
+            {
+              Sid    = "AllowS3Access"
+              Effect = "Allow"
+              Action = [
+                "s3:GetObject",
+                "s3:ListBucket"
+              ]
+              Resource = [
+                "arn:aws:s3:::cs-library-artifacts",
+                "arn:aws:s3:::cs-library-artifacts/*"
+              ]
+            }
+          ]
+        })
+      }
+    }
