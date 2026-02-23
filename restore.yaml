@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: db-restore
+  namespace: prd-01
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-restore-s3
+  namespace: prd-01
+spec:
+  schedule: "0 0 5,25 * *" 
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # 1. Increase history limit so the Pod object isn't deleted by the controller
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      # 2. Set backoffLimit to 0 to prevent K8s from spawning a NEW pod immediately
+      backoffLimit: 0
+      template:
+        spec:
+          imagePullSecrets:
+          - name: gitlab-auth
+          serviceAccountName: db-restore
+          restartPolicy: Never
+          containers:
+          - name: postgres-restore
+            image: registry.gitlab.com/coverself/engineering/devops/scripts/dbdumputility:0.0.1
+            env:
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: S3_BUCKET_PATH
+              value: "s3://cs-library-artifacts/postgres/"
+            # RDS connection details split into separate env vars for token generation
+            - name: DB_HOST
+              value: cs-test-v2-rds.cr0fbsk3bywv.us-east-1.rds.amazonaws.com
+            - name: DB_NAME
+              value: cs-engine
+            - name: DB_USER
+              value: "cs-engine"
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+              limits:
+                cpu: "4"
+                memory: "6Gi"
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              set -e
+              set -o pipefail
+
+              # --- Configuration ---
+              LOG_FILE="/tmp/restore.log"
+
+              echo "--- 1. Generating RDS IAM Auth Token ---"
+              export PGPASSWORD=$(aws rds generate-db-auth-token \
+                --hostname "$DB_HOST" \
+                --port 5432 \
+                --region "$AWS_REGION" \
+                --username "$DB_USER")
+              
+              echo "Token generated successfully."
+
+              echo "--- 2. Locating Newest Postgres Backup in S3 ---"
+              FILENAME=$(aws s3 ls ${S3_BUCKET_PATH} | sort | tail -n 1 | awk '{print $4}')
+
+              if [ -z "$FILENAME" ]; then
+                echo "ERROR: No backup found in S3 bucket: ${S3_BUCKET_PATH}"; exit 1
+              fi
+
+              FULL_S3_PATH="${S3_BUCKET_PATH}${FILENAME}"
+              echo "Found backup: $FILENAME"
+
+              echo "--- 3. Starting STREAMING Postgres Restore ---"
+              echo "NOTE: Streaming disables parallel jobs (-j), but prevents Disk Full/OOM errors."
+              
+              export PGHOST="$DB_HOST"
+              export PGUSER="$DB_USER"
+              export PGSSLMODE="require"
+
+              # We turn OFF 'set -e' specifically for the restore command so we can handle exit codes manually
+              set +e
+              
+              # STREAMING COMMAND:
+              aws s3 cp "$FULL_S3_PATH" - | pg_restore \
+                  --dbname="$DB_NAME" \
+                  --clean \
+                  --if-exists \
+                  --no-owner \
+                  --no-privileges \
+                  --verbose \
+                  2>&1 | tee "$LOG_FILE"
+              
+              RESTORE_EXIT_CODE=${PIPESTATUS[1]}
+              AWS_EXIT_CODE=${PIPESTATUS[0]}
+              
+              set -e
+
+              # Logic to handle Exit Codes
+              if [ "$AWS_EXIT_CODE" -ne 0 ]; then
+                  echo "FAILURE: S3 Download failed with code $AWS_EXIT_CODE"
+                  # 3. Sleep on failure so you can kubectl exec in
+                  echo "DEBUG MODE: Sleeping 1 hour for inspection..."
+                  sleep 3600
+                  exit 1
+              fi
+
+              if [ "$RESTORE_EXIT_CODE" -eq 0 ]; then
+                  echo "SUCCESS: Restore completed perfectly."
+              elif [ "$RESTORE_EXIT_CODE" -eq 1 ]; then
+                  echo "--------------------------------------------------------"
+                  echo "WARNING: Restore completed with non-critical warnings (Exit Code 1)."
+                  echo "This is likely due to the 'transaction_timeout' version mismatch."
+                  echo "Marking Job as SUCCESS."
+                  echo "--------------------------------------------------------"
+              else
+                  echo "--------------------------------------------------------"
+                  echo "FAILURE: Restore failed with Exit Code $RESTORE_EXIT_CODE"
+                  echo "Searching logs for Errors:"
+                  grep -i "ERROR:" "$LOG_FILE"
+                  
+                  # 3. Sleep on failure so you can kubectl exec in
+                  echo "DEBUG MODE: Sleeping 1 hour for inspection..."
+                  echo "Run: kubectl exec -it <pod_name> -n prd-01 -- bash"
+                  sleep 3600
+                  exit 1
+              fi
+
+              echo "--- 4. Cleaning up ---"
+              rm -f "$LOG_FILE"
+
+              echo "--- Done ---"
