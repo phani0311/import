@@ -1,0 +1,86 @@
+configs:
+  params:
+    server.insecure: true
+  credentialTemplates:
+    https-creds:
+      url: https://gitlab.com/coverself/engineering/commons/helm-charts.git
+      password: "{{ secret('ARGOCD_PASSWORD') }}"
+      username: argo-cd-deploy
+  repositories:
+    helm-charts-repo:
+      url: https://gitlab.com/coverself/engineering/commons/helm-charts.git
+  cm:
+    timeout:
+      reconciliation: 30s
+    create: true
+    admin.enabled: "true"
+    application.instanceLabelKey: argocd.argoproj.io/instance
+    exec.enabled: "false"
+    oidc.config: |
+      name: Keycloak
+      issuer: https://id.mycs.zone/realms/coverself-apps
+      clientID: argocd
+      clientSecret: $oidc.keycloak.clientSecret
+      requestedScopes: ["openid", "profile", "email", "groups"]
+    server.rbac.log.enforce.enable: "false"
+    statusbadge.enabled: "false"
+    timeout.hard.reconciliation: 0s
+    timeout.reconciliation: 60s
+    url: https://<argo-dns>/
+  rbac:
+    policy.csv: |
+      g, ArgoCDAdmins, role:admin
+      g, ArgoCDViewers, role:readonly
+    policy.default: ""
+    policy.matchMode: glob
+    scopes: '[groups]'
+
+
+controller:
+  enableStatefulSet: true
+  replicas: 2
+  env:
+    - name: ARGOCD_CONTROLLER_REPLICAS
+      value: "2"
+
+server:
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
+
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      kubernetes.io/ingress.class: alb
+      alb.ingress.kubernetes.io/scheme: internal
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/group.name: alb
+      alb.ingress.kubernetes.io/load-balancer-attributes: "deletion_protection.enabled=false" 
+      alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:661547428338:certificate/f1b00b68-907e-4947-ad65-6d755fff8671
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+      alb.ingress.kubernetes.io/actions.ssl-redirect: '{"Type": "redirect", "RedirectConfig": { "Protocol": "HTTPS", "Port": "443", "StatusCode": "HTTP_301"}}'
+      external-dns.alpha.kubernetes.io/hostname: deploy.mycs.zone
+    # extraTls:
+    #   - hosts:
+    #     - deploy.mycs.zone
+    #     # Based on the ingress controller used secret might be optional
+    #     secretName: certificate-tls
+
+
+repoServer:
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 2
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
+
+redis-ha:
+  enabled: false
+
+global:
+  domain: deploy.mycs.zone
